@@ -4,6 +4,7 @@
 # 优先使用本地Python环境，避免虚拟环境冲突
 import sys
 import os
+import math
 
 # 控制台输出统一为 UTF-8（打包为无窗口程序时避免GBK编码报错）
 for _stream in (sys.stdout, sys.stderr):
@@ -363,7 +364,13 @@ class MainWindow(QMainWindow):
         
         # 启动时刷新一次原料表
         self.refresh_ingredient_table()
-        
+
+        # 状态栏常驻显示当前数据库路径，避免误判数据没保存
+        if hasattr(self, 'db_path'):
+            self.statusBar().showMessage(f"数据库：{self.db_path}")
+            self.statusBar().setToolTip(
+                "所有增删改都写入这个文件；源码运行与打包exe会各自使用独立的数据库")
+
     def init_database(self):
         """初始化数据库"""
         try:
@@ -374,6 +381,11 @@ class MainWindow(QMainWindow):
                 base_dir = current_dir
             db_path = os.path.join(base_dir, 'fragrance_management.db')
             db_existed = os.path.exists(db_path)
+            # 记录实际使用的数据库路径：
+            # 从源码运行(src/)与运行打包exe(release/)会指向不同的库，
+            # 打印出来便于排查「改了数据但看起来没变」的问题
+            self.db_path = db_path
+            print(f"数据库路径: {db_path}（{'已存在' if db_existed else '新建'}）")
             # 添加线程安全配置
             engine = create_engine(f'sqlite:///{db_path}',
                                  pool_pre_ping=True,
@@ -1498,74 +1510,90 @@ class MainWindow(QMainWindow):
         #     self.show_operation_log_stats(time_range)
             
     def show_ingredient_usage_stats(self, time_range):
-        """显示原料使用频率统计"""
-        # 获取时间范围
+        """显示原料使用频率统计（按配方引用次数 Top20）"""
+        # 获取时间范围（按配方创建时间过滤）
         start_date = self.get_start_date(time_range)
-        
+
         # 查询数据
         query = self.session.query(
-            ingredient_formula.c.ingredient_id, # Use c for column
+            ingredient_formula.c.ingredient_id,
             Ingredient.name,
-            func.count(ingredient_formula.c.formula_id).label('usage_count') # Use c for column
+            func.count(ingredient_formula.c.formula_id).label('usage_count')
         ).join(
             Ingredient,
-            ingredient_formula.c.ingredient_id == Ingredient.id # Use c for column
+            ingredient_formula.c.ingredient_id == Ingredient.id
         ).join(
             Formula,
-            ingredient_formula.c.formula_id == Formula.id # Use c for column
+            ingredient_formula.c.formula_id == Formula.id
         )
-        
+
         if start_date:
             query = query.filter(Formula.created_at >= start_date)
-            
+
         results = query.group_by(
-            ingredient_formula.c.ingredient_id, # Use c for column
+            ingredient_formula.c.ingredient_id,
             Ingredient.name
         ).order_by(
             text('usage_count DESC')
         ).limit(20).all()
-        
+
+        if not results:
+            self._show_empty_chart(
+                "原料使用频率统计",
+                f"所选时间范围（{time_range}）内暂无配方成分数据。")
+            return
+
+        # 全局引用总次数：用于计算真实占比，
+        # 不能用 Top20 之和做分母（那样占比会被放大且合计不为 100%）
+        total_query = self.session.query(
+            func.count(ingredient_formula.c.formula_id)
+        ).select_from(ingredient_formula).join(
+            Formula, ingredient_formula.c.formula_id == Formula.id
+        )
+        if start_date:
+            total_query = total_query.filter(Formula.created_at >= start_date)
+        total_usage = total_query.scalar() or 0
+
         # 创建图表
         chart = QChart()
-        chart.setTitle("原料使用频率统计")
-        
+        chart.setTitle(f"原料使用频率统计 Top20（{time_range}）")
+
         # 创建柱状图系列
         series = QBarSeries()
         bar_set = QBarSet("使用次数")
-        
+
         # 添加数据
         categories = []
         for result in results:
             bar_set.append(result.usage_count)
-            categories.append(result.name)
-            
+            categories.append(result.name or '')
+
         series.append(bar_set)
         chart.addSeries(series)
-        
+
         # 设置坐标轴
         axis_x = QBarCategoryAxis()
         axis_x.append(categories)
         chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         series.attachAxis(axis_x)
-        
+
         axis_y = QValueAxis()
-        # Handle case where results list is empty
-        max_usage = max(r.usage_count for r in results) if results else 10
-        axis_y.setRange(0, max_usage * 1.1)
+        max_usage = max(r.usage_count for r in results)
+        axis_y.setRange(0, max_usage * 1.1 if max_usage > 0 else 10)
+        axis_y.setTitleText("被配方引用次数")
         chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         series.attachAxis(axis_y)
-        
+
         # 更新图表视图
         self.chart_view.setChart(chart)
-        
+
         # 更新数据表格
         self.stat_table.setColumnCount(3)
-        self.stat_table.setHorizontalHeaderLabels(["原料名称", "使用次数", "使用率"])
+        self.stat_table.setHorizontalHeaderLabels(["原料名称", "使用次数", "占比"])
         self.stat_table.setRowCount(len(results))
-        
-        total_usage = sum(r.usage_count for r in results) if results else 0
+
         for row, result in enumerate(results):
-            self.stat_table.setItem(row, 0, QTableWidgetItem(result.name))
+            self.stat_table.setItem(row, 0, QTableWidgetItem(result.name or ''))
             self.stat_table.setItem(row, 1, QTableWidgetItem(str(result.usage_count)))
             usage_rate = (result.usage_count / total_usage * 100) if total_usage > 0 else 0
             self.stat_table.setItem(row, 2, QTableWidgetItem(f"{usage_rate:.2f}%"))
@@ -1586,145 +1614,151 @@ class MainWindow(QMainWindow):
             query = query.filter(Formula.created_at >= start_date)
             
         results = query.order_by(Formula.created_at).all()
-        
+
+        # 仅保留可绘制的数据点（成本与时间均有效）
+        points = [r for r in results
+                  if r.created_at is not None and r.total_cost is not None]
+
+        if not points:
+            self._show_empty_chart(
+                "配方成本统计",
+                f"所选时间范围（{time_range}）内暂无带成本数据的配方。\n"
+                f"（共 {len(results)} 个配方，但均未记录成本）")
+            return
+
         # 创建图表
         chart = QChart()
-        chart.setTitle("配方成本统计")
-        
+        chart.setTitle(f"配方成本统计（{time_range}）")
+
         # 创建折线图系列
         series = QLineSeries()
-        
+        series.setName("配方成本")
+
         # 添加数据
-        for result in results:
-            if result.created_at and result.total_cost is not None:
-                # 将Python datetime转换为QDateTime
-                qdt = QDateTime.fromString(result.created_at.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd hh:mm:ss")
-                series.append(qdt.toMSecsSinceEpoch(), result.total_cost)
-            
+        for result in points:
+            # 将Python datetime转换为QDateTime
+            qdt = QDateTime.fromString(
+                result.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "yyyy-MM-dd hh:mm:ss")
+            series.append(qdt.toMSecsSinceEpoch(), result.total_cost)
+
         chart.addSeries(series)
-        
+
         # 设置坐标轴
         axis_x = QDateTimeAxis()
         axis_x.setFormat("yyyy-MM-dd")
         axis_x.setTitleText("日期")
         chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         series.attachAxis(axis_x)
-        
+
         axis_y = QValueAxis()
-        # Handle case where results list is empty
-        max_cost = max(r.total_cost for r in results) if results and any(r.total_cost is not None for r in results) else 10
-        axis_y.setRange(0, max_cost * 1.1)
+        # 只对非空成本求最大值，避免 None 参与比较导致 TypeError
+        costs = [r.total_cost for r in points]
+        max_cost = max(costs)
+        axis_y.setRange(0, max_cost * 1.1 if max_cost > 0 else 10)
         axis_y.setTitleText("成本")
         chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
         series.attachAxis(axis_y)
-        
+
         # 更新图表视图
         self.chart_view.setChart(chart)
-        
+
         # 更新数据表格
         self.stat_table.setColumnCount(3)
         self.stat_table.setHorizontalHeaderLabels(["配方名称", "成本", "创建时间"])
         self.stat_table.setRowCount(len(results))
-        
+
         for row, result in enumerate(results):
-            self.stat_table.setItem(row, 0, QTableWidgetItem(result.name))
-            self.stat_table.setItem(row, 1, QTableWidgetItem(f"{result.total_cost:.2f}" if result.total_cost is not None else ""))
+            self.stat_table.setItem(row, 0, QTableWidgetItem(result.name or ""))
+            self.stat_table.setItem(row, 1, QTableWidgetItem(
+                f"{result.total_cost:,.2f}" if result.total_cost is not None else "未记录"))
             self.stat_table.setItem(row, 2, QTableWidgetItem(
-                result.created_at.strftime("%Y-%m-%d %H:%M:%S") if result.created_at else ""
+                result.created_at.strftime("%Y-%m-%d %H:%M")
+                if result.created_at else ""
             ))
             
+    def _show_empty_chart(self, title, message):
+        """在图表区显示空数据提示，并清空统计表格"""
+        chart = QChart()
+        chart.setTitle(title)
+        self.chart_view.setChart(chart)
+        self.stat_table.setColumnCount(1)
+        self.stat_table.setHorizontalHeaderLabels(["提示"])
+        self.stat_table.setRowCount(1)
+        self.stat_table.setItem(0, 0, QTableWidgetItem(message))
+
     def show_gcms_analysis_stats(self, time_range):
-        """显示GC-MS分析统计"""
+        """显示GC-MS分析统计（按供应商分布 + 样品明细）
+
+        注意：GCMSAnalysis 实际字段为 number/name/supplier/analysis_time，
+        原先误用了不存在的 status/sample_name/created_at，导致统计恒为「未知」。
+        """
         try:
-            # 获取时间范围
             start_date = self.get_start_date(time_range)
-            
-            # 查询数据 - 使用更安全的查询方式
+
             query = self.session.query(GCMSAnalysis)
-            
-            # 如果有时间范围且GCMSAnalysis有created_at字段，则过滤
-            if start_date and hasattr(GCMSAnalysis, 'created_at'):
-                query = query.filter(GCMSAnalysis.created_at >= start_date)
-            
-            results = query.all()
-            
-            # 创建图表
+            if start_date:
+                # 无分析时间的记录视为不限时间范围，避免被误过滤掉
+                query = query.filter(
+                    (GCMSAnalysis.analysis_time >= start_date) |
+                    (GCMSAnalysis.analysis_time.is_(None))
+                )
+            results = query.order_by(GCMSAnalysis.analysis_time.desc()).all()
+
+            if not results:
+                self._show_empty_chart(
+                    "GC-MS分析统计",
+                    f"所选时间范围（{time_range}）内暂无GC-MS分析记录。")
+                return
+
+            # 一次性统计各分析的化合物数量，避免逐条查询
+            analysis_ids = [a.id for a in results]
+            counts = dict(
+                self.session.query(
+                    GCMSCompound.analysis_id,
+                    func.count(GCMSCompound.id)
+                ).filter(GCMSCompound.analysis_id.in_(analysis_ids))
+                 .group_by(GCMSCompound.analysis_id).all()
+            )
+
+            # 按供应商统计样品分布
+            supplier_counts = {}
+            for analysis in results:
+                supplier = (analysis.supplier or '').strip() or '未填写供应商'
+                supplier_counts[supplier] = supplier_counts.get(supplier, 0) + 1
+
             chart = QChart()
-            chart.setTitle("GC-MS分析统计")
-            
-            # 创建饼图系列
+            chart.setTitle(f"GC-MS分析统计（{time_range}，共 {len(results)} 条）")
             series = QPieSeries()
-            
-            # 统计状态
-            status_counts = {}
-            sample_counts = {}
-            
-            for analysis in results:
-                # 统计状态分布
-                status = getattr(analysis, 'status', '未知状态')
-                if status:
-                    status_counts[status] = status_counts.get(status, 0) + 1
-                
-                # 统计样品分布
-                sample_name = getattr(analysis, 'sample_name', '未知样品')
-                if sample_name:
-                    sample_counts[sample_name] = sample_counts.get(sample_name, 0) + 1
-            
-            # 如果没有数据，显示提示
-            if not status_counts:
-                status_counts['暂无数据'] = 1
-            
-            # 添加数据到饼图
-            for status, count in status_counts.items():
-                series.append(f"{status} ({count})", count)
-                
+            for supplier, count in sorted(
+                    supplier_counts.items(), key=lambda kv: kv[1], reverse=True):
+                slice_ = series.append(f"{supplier} ({count})", count)
+                slice_.setLabelVisible(True)
             chart.addSeries(series)
-            
-            # 更新图表视图
             self.chart_view.setChart(chart)
-            
-            # 更新数据表格
-            self.stat_table.setColumnCount(4)
-            self.stat_table.setHorizontalHeaderLabels(["状态", "数量", "样品名称", "分析时间"])
-            
-            # 准备表格数据
-            table_data = []
-            for analysis in results:
-                status = getattr(analysis, 'status', '未知状态')
-                sample_name = getattr(analysis, 'sample_name', '未知样品')
-                created_at = getattr(analysis, 'created_at', None)
-                created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S") if created_at else "未知时间"
-                
-                table_data.append([status, "1", sample_name, created_at_str])
-            
-            # 如果没有数据，显示提示行
-            if not table_data:
-                table_data = [["暂无数据", "0", "无", "无"]]
-            
-            self.stat_table.setRowCount(len(table_data))
-            
-            for row, data in enumerate(table_data):
-                for col, value in enumerate(data):
+
+            # 明细表格
+            headers = ["编号", "样品名称", "供应商", "化合物数", "分析时间"]
+            self.stat_table.setColumnCount(len(headers))
+            self.stat_table.setHorizontalHeaderLabels(headers)
+            self.stat_table.setRowCount(len(results))
+
+            for row, analysis in enumerate(results):
+                analysis_time = analysis.analysis_time
+                values = [
+                    analysis.number or '',
+                    analysis.name or '',
+                    analysis.supplier or '',
+                    str(counts.get(analysis.id, 0)),
+                    analysis_time.strftime("%Y-%m-%d %H:%M")
+                    if analysis_time else "未记录",
+                ]
+                for col, value in enumerate(values):
                     self.stat_table.setItem(row, col, QTableWidgetItem(str(value)))
-                    
+
         except Exception as e:
-            # 错误处理
             QMessageBox.warning(self, "统计错误", f"GC-MS分析统计时发生错误：{str(e)}")
-            
-            # 显示错误信息的图表
-            chart = QChart()
-            chart.setTitle("GC-MS分析统计 - 错误")
-            series = QPieSeries()
-            series.append("数据加载失败", 1)
-            chart.addSeries(series)
-            self.chart_view.setChart(chart)
-            
-            # 显示错误信息的表格
-            self.stat_table.setColumnCount(2)
-            self.stat_table.setHorizontalHeaderLabels(["错误信息", "详情"])
-            self.stat_table.setRowCount(1)
-            self.stat_table.setItem(0, 0, QTableWidgetItem("数据加载失败"))
-            self.stat_table.setItem(0, 1, QTableWidgetItem(str(e)))
+            self._show_empty_chart("GC-MS分析统计 - 错误", str(e))
 
     # Removed show_operation_log_stats method
             
@@ -2366,12 +2400,39 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "修改失败", f"修改原料信息时发生错误：{str(e)}")
 
     def delete_ingredient(self, ingredient):
-        reply = QMessageBox.question(self, "确认删除", f"确定要删除原料：{ingredient.name}（CAS: {ingredient.cas_number}）吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        """删除原料（先提示关联影响，异常时回滚）"""
+        try:
+            # 统计关联影响：被多少配方引用、有多少库存记录
+            formula_count = self.session.query(
+                func.count(ingredient_formula.c.formula_id)
+            ).filter(
+                ingredient_formula.c.ingredient_id == ingredient.id
+            ).scalar() or 0
+            stock_count = self.session.query(StockRecord).filter_by(
+                ingredient_id=ingredient.id, is_deleted=False).count()
+
+            msg = f"确定要删除原料：{ingredient.name}（CAS: {ingredient.cas_number}）吗？"
+            tips = []
+            if formula_count:
+                tips.append(f"该原料被 {formula_count} 个配方引用，删除后会从这些配方中移除")
+            if stock_count:
+                tips.append(f"存在 {stock_count} 条关联库存记录，删除后这些记录将失去原料关联")
+            if tips:
+                msg += "\n\n注意：\n· " + "\n· ".join(tips)
+
+            reply = QMessageBox.question(
+                self, "确认删除", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
             self.session.delete(ingredient)
             self.session.commit()
             self.refresh_ingredient_table()
             QMessageBox.information(self, "删除成功", "原料已删除！")
+        except Exception as e:
+            self.session.rollback()
+            QMessageBox.critical(self, "删除失败", f"删除原料时发生错误：{str(e)}")
 
     def show_image_dialog(self, pixmap, title="图片预览"):
         dlg = QDialog(self)
@@ -2899,12 +2960,30 @@ class MainWindow(QMainWindow):
 
 
     def delete_gcms(self, analysis):
-        reply = QMessageBox.question(self, "确认删除", f"确定要删除GC-MS分析：{analysis.name} 吗？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        """删除GC-MS分析（连带删除其化合物，失败时回滚）"""
+        try:
+            compound_count = self.session.query(GCMSCompound).filter_by(
+                analysis_id=analysis.id).count()
+            msg = f"确定要删除GC-MS分析：{analysis.name} 吗？"
+            if compound_count:
+                msg += f"\n\n注意：该分析包含 {compound_count} 条化合物记录，将一并删除。"
+
+            reply = QMessageBox.question(
+                self, "确认删除", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            # 显式删除化合物，避免依赖数据库级联配置
+            self.session.query(GCMSCompound).filter_by(
+                analysis_id=analysis.id).delete(synchronize_session=False)
             self.session.delete(analysis)
             self.session.commit()
             self.refresh_gcms_table()
             QMessageBox.information(self, "删除成功", "GC-MS分析已删除！")
+        except Exception as e:
+            self.session.rollback()
+            QMessageBox.critical(self, "删除失败", f"删除GC-MS分析时发生错误：{str(e)}")
 
     def show_gcms_result(self, analysis):
         dlg = GCMSResultDialog(self, analysis, self.session)
@@ -3653,105 +3732,116 @@ class FormulaDialog(QDialog):
         self.update_percent()
 
     def import_formula_data(self):
-        """导入配方数据从CSV文件"""
-        file_dialog = QFileDialog()
-        file_path, _ = file_dialog.getOpenFileName(
-            self, 
-            "导入配方数据", 
-            "", 
-            "CSV Files (*.csv);;Excel Files (*.xlsx *.xls)"
-        )
-        
+        """导入配方用量数据（支持 xlsx/xlsm/xls/csv/tsv/txt 及伪Excel文件）"""
+        try:
+            from table_io import read_table_any, SUPPORTED_FILE_FILTER
+        except ImportError as e:
+            QMessageBox.critical(self, "导入失败", f"表格读取模块加载失败：{e}")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "导入配方数据", "", SUPPORTED_FILE_FILTER)
+
         if not file_path:
             return
-            
+
         try:
-            import csv
-            import os
-            
-            data = []
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            if file_ext == '.csv':
-                with open(file_path, 'r', encoding='utf-8-sig') as f:
-                    reader = csv.DictReader(f)
-                    data = list(reader)
-            else:
-                # 对于Excel文件，我们使用简单的提示，因为没有pandas
-                QMessageBox.information(
-                    self, 
-                    "提示", 
-                    "请将Excel文件另存为CSV格式后再导入。\n\n"
-                    "CSV文件格式：\n"
-                    "原料名称,用量,稀释倍数,稀释溶剂\n"
-                    "测试原料1,10.5,1.0,PG\n"
-                    "测试原料2,20.0,2.0,乙醇"
-                )
+            df = read_table_any(file_path)
+            if df.empty:
+                QMessageBox.warning(self, "警告", "文件为空或格式不正确")
                 return
-            
-            if not data:
-                QMessageBox.warning(self, "警告", "CSV文件为空或格式不正确")
-                return
-                
-            # 检查CSV格式
+
+            # 列名兼容：忽略大小写与空白，常见别名统一到标准列名
+            col_alias = {
+                '原料名称': '原料名称', '原料': '原料名称', '名称': '原料名称',
+                '用量': '用量', '用量(g)': '用量', '用量g': '用量',
+                '添加量': '用量',
+                '稀释倍数': '稀释倍数', '稀释': '稀释倍数',
+                '稀释溶剂': '稀释溶剂', '溶剂': '稀释溶剂',
+            }
+            lower_map = {str(c).strip().lower(): c for c in df.columns}
+            renamed, used_std = {}, set()
+            for src, std in col_alias.items():
+                if std in used_std:
+                    continue
+                col = lower_map.get(src.lower())
+                if col is not None:
+                    renamed[col] = std
+                    used_std.add(std)
+            df = df.rename(columns=renamed)
+
             required_columns = ['原料名称', '用量']
             optional_columns = ['稀释倍数', '稀释溶剂']
-            
-            if not all(col in data[0].keys() for col in required_columns):
+            missing = [c for c in required_columns if c not in df.columns]
+            if missing:
                 QMessageBox.warning(
-                    self, 
-                    "格式错误", 
-                    f"CSV文件必须包含以下列：{', '.join(required_columns)}\n"
-                    f"可选列：{', '.join(optional_columns)}\n\n"
-                    f"当前文件列：{', '.join(data[0].keys())}"
+                    self,
+                    "格式错误",
+                    f"文件必须包含以下列：{'、'.join(required_columns)}\n"
+                    f"可选列：{'、'.join(optional_columns)}\n\n"
+                    f"当前文件列：{'、'.join(str(c) for c in df.columns)}\n"
+                    f"缺少：{'、'.join(missing)}"
                 )
                 return
-            
+
+            data = df.to_dict('records')
+
             # 导入数据到表格
             imported_count = 0
+            unmatched = []
             for csv_row in data:
                 ingredient_name = csv_row.get('原料名称', '').strip()
                 if not ingredient_name:
                     continue
                     
                 # 查找对应的原料行
+                matched_row = None
                 for table_row in range(self.amount_table.rowCount()):
                     table_ingredient_name = self.amount_table.item(table_row, 0).text()
                     if table_ingredient_name == ingredient_name:
-                        # 设置用量
-                        try:
-                            amount = float(csv_row.get('用量', '0'))
-                            self.amount_spins[table_row].setValue(amount)
-                        except ValueError:
-                            pass
-                            
-                        # 设置稀释倍数
-                        if '稀释倍数' in csv_row:
-                            try:
-                                dilution = float(csv_row.get('稀释倍数', '1.0'))
-                                self.dilution_spins[table_row].setValue(dilution)
-                            except ValueError:
-                                pass
-                                
-                        # 设置稀释溶剂
-                        if '稀释溶剂' in csv_row:
-                            solvent = csv_row.get('稀释溶剂', 'PG').strip()
-                            combo = self.solvent_combos[table_row]
-                            index = combo.findText(solvent)
-                            if index >= 0:
-                                combo.setCurrentIndex(index)
-                            else:
-                                combo.setCurrentText(solvent)
-                                
-                        imported_count += 1
+                        matched_row = table_row
                         break
-            
+                if matched_row is None:
+                    unmatched.append(ingredient_name)
+                    continue
+
+                table_row = matched_row
+                # 设置用量
+                try:
+                    amount = float(csv_row.get('用量', '0') or 0)
+                    self.amount_spins[table_row].setValue(amount)
+                except ValueError:
+                    pass
+
+                # 设置稀释倍数
+                if '稀释倍数' in csv_row:
+                    try:
+                        dilution = float(csv_row.get('稀释倍数', '1.0') or 1.0)
+                        self.dilution_spins[table_row].setValue(dilution)
+                    except ValueError:
+                        pass
+
+                # 设置稀释溶剂
+                if '稀释溶剂' in csv_row:
+                    solvent = (csv_row.get('稀释溶剂') or 'PG').strip()
+                    if solvent:
+                        combo = self.solvent_combos[table_row]
+                        index = combo.findText(solvent)
+                        if index >= 0:
+                            combo.setCurrentIndex(index)
+                        else:
+                            combo.setCurrentText(solvent)
+
+                imported_count += 1
+
             self.update_percent()  # 重新计算百分比
-            QMessageBox.information(
-                self, 
-                "导入成功", 
-                f"成功导入 {imported_count} 个原料的数据"
-            )
+            msg = f"成功导入 {imported_count} 个原料的数据"
+            if unmatched:
+                shown = "、".join(unmatched[:8])
+                more = f" 等 {len(unmatched)} 项" if len(unmatched) > 8 else ""
+                msg += (f"\n\n以下原料未在当前配方的原料清单中找到，已跳过：\n"
+                        f"{shown}{more}")
+            QMessageBox.information(self, "导入成功", msg)
             
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"导入过程中发生错误：{str(e)}")
@@ -4148,28 +4238,59 @@ class GCMSAnalysisDialog(QDialog):
                               "3. 或查看'依赖包问题解决方案.md'")
             return
 
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择化合物数据文件", "", "Excel 文件 (*.xlsx *.xls);;CSV 文件 (*.csv)")
+        try:
+            from table_io import read_table_any, SUPPORTED_FILE_FILTER
+        except ImportError as e:
+            QMessageBox.critical(self, "导入失败", f"表格读取模块加载失败：{e}")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择化合物数据文件", "", SUPPORTED_FILE_FILTER)
         if not file_path:
             return
 
         try:
-            if file_path.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(file_path)
-            elif file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
-            else:
-                QMessageBox.warning(self, "格式错误", "仅支持Excel或CSV文件！")
+            df = read_table_any(file_path)
+            if df.empty:
+                QMessageBox.warning(self, "警告", "文件为空或格式不正确")
                 return
 
-            # Expected columns based on user request (adjust if column names in file differ)
-            expected_columns = ['CAS号', '组分RT', '化合物名称', '中文名', '匹配因子', '分子式', '相对含量mg/L']
-            # Check if all expected columns are in the dataframe (case-insensitive check)
-            df.columns = df.columns.str.strip()
-            df_cols_lower = [col.lower() for col in df.columns]
-            if not all(col.lower() in df_cols_lower for col in expected_columns):
-                 missing_cols = [col for col in expected_columns if col.lower() not in df_cols_lower]
-                 QMessageBox.warning(self, "表头错误", f"导入文件缺少以下列：{', '.join(missing_cols)}\n请检查文件表头是否包含：{', '.join(expected_columns)}")
-                 return
+            # 标准列名及其允许的别名（匹配时忽略大小写与首尾空白）
+            std_columns = ['CAS号', '组分RT', '化合物名称', '中文名',
+                           '匹配因子', '分子式', '相对含量mg/L']
+            aliases = {
+                'CAS号': ['cas号', 'cas', 'cas no', 'cas number'],
+                '组分RT': ['组分rt', 'rt', 'rt(min)', '保留时间',
+                          'retention time'],
+                '化合物名称': ['化合物名称', '英文名称', '英文名', 'compound',
+                              'compound name', 'name_en'],
+                '中文名': ['中文名', '中文名称', 'name_cn', 'chinese name'],
+                '匹配因子': ['匹配因子', 'match', 'match factor', '相似度'],
+                '分子式': ['分子式', 'formula', 'molecular formula'],
+                '相对含量mg/L': ['相对含量mg/l', '相对含量(mg/l)', '相对含量',
+                                '含量', '浓度', 'content', 'relative content'],
+            }
+            lower_map = {str(c).strip().lower(): c for c in df.columns}
+            col_of, missing_cols = {}, []
+            for std in std_columns:
+                hit = next((lower_map[a] for a in aliases[std] if a in lower_map), None)
+                if hit is None:
+                    missing_cols.append(std)
+                else:
+                    col_of[std] = hit
+
+            if missing_cols:
+                QMessageBox.warning(
+                    self, "表头错误",
+                    f"导入文件缺少以下列：{'、'.join(missing_cols)}\n"
+                    f"请检查文件表头是否包含：{'、'.join(std_columns)}\n\n"
+                    f"当前文件列：{'、'.join(str(c) for c in df.columns)}")
+                return
+
+            def _cell(row, std):
+                """取单元格文本，空值统一返回空字符串"""
+                val = row.get(col_of[std], '')
+                return '' if val is None else str(val).strip()
 
             # Clear existing compounds from the table for fresh import
             self.compound_table.setRowCount(0)
@@ -4177,18 +4298,22 @@ class GCMSAnalysisDialog(QDialog):
             imported_count = 0
             for index, row in df.iterrows():
                 # Create a QTableWidgetItem for each cell and set its value
+                cas_number = _cell(row, 'CAS号')
+                rt_str = _cell(row, '组分RT')
+                name_en = _cell(row, '化合物名称')
+                name_cn = _cell(row, '中文名')
+                match_factor_str = _cell(row, '匹配因子')
+                molecular_formula = _cell(row, '分子式')
+                relative_content_str = _cell(row, '相对含量mg/L')
+
+                # 整行全空则跳过
+                if not any([cas_number, rt_str, name_en, name_cn,
+                            match_factor_str, molecular_formula,
+                            relative_content_str]):
+                    continue
+
                 current_row = self.compound_table.rowCount()
                 self.compound_table.insertRow(current_row)
-
-                # Get data from DataFrame row using column names (case-insensitive)
-                # Ensure we get the data even if the cell is empty in Excel/CSV
-                cas_number = str(row.get('CAS号', None) or '')
-                rt_str = str(row.get('组分RT', None) or '')
-                name_en = str(row.get('化合物名称', None) or '')
-                name_cn = str(row.get('中文名', None) or '')
-                match_factor_str = str(row.get('匹配因子', None) or '')
-                molecular_formula = str(row.get('分子式', None) or '')
-                relative_content_str = str(row.get('相对含量mg/L', None) or '')
 
                 # Populate table cells with data from DataFrame columns using correct indices
                 # Indices correspond to the table headers:
@@ -4374,6 +4499,11 @@ class GCMSAnalysisFuncDialog(QDialog):
 
         self.feature_fig_label = QLabel()
         feature_layout.addWidget(self.feature_fig_label)
+
+        self.feature_table = QTableWidget()
+        self.feature_table.setMinimumHeight(150)
+        self.feature_table.setAlternatingRowColors(True)
+        feature_layout.addWidget(self.feature_table)
         self.feature_tab.setLayout(feature_layout)
         tabs.addTab(self.feature_tab, "特征物质筛查")
 
@@ -4395,16 +4525,27 @@ class GCMSAnalysisFuncDialog(QDialog):
 
         self.diff_fig_label = QLabel()
         diff_layout.addWidget(self.diff_fig_label)
+
+        self.diff_table = QTableWidget()
+        self.diff_table.setMinimumHeight(150)
+        self.diff_table.setAlternatingRowColors(True)
+        diff_layout.addWidget(self.diff_table)
         self.diff_tab.setLayout(diff_layout)
         tabs.addTab(self.diff_tab, "差异物质分析")
 
         # --- 可视化Tab ---
         self.vis_tab = QWidget()
         vis_layout = QVBoxLayout()
-        vis_layout.addWidget(QLabel("可视化功能（如谱图、PCA、热图等）"))
-        self.vis_btn = QPushButton("显示热图示例")
+        vis_layout.addWidget(QLabel("可视化功能（热图 / PCA 降维）"))
+
+        vis_btn_layout = QHBoxLayout()
+        self.vis_btn = QPushButton("显示热图")
         self.vis_btn.clicked.connect(self.show_heatmap)
-        vis_layout.addWidget(self.vis_btn)
+        self.pca_btn = QPushButton("PCA 分析")
+        self.pca_btn.clicked.connect(self.run_pca_analysis)
+        vis_btn_layout.addWidget(self.vis_btn)
+        vis_btn_layout.addWidget(self.pca_btn)
+        vis_layout.addLayout(vis_btn_layout)
 
         # Export buttons for visualization
         vis_export_layout = QHBoxLayout()
@@ -4416,6 +4557,11 @@ class GCMSAnalysisFuncDialog(QDialog):
 
         self.vis_fig_label = QLabel()
         vis_layout.addWidget(self.vis_fig_label)
+
+        self.vis_table = QTableWidget()
+        self.vis_table.setMinimumHeight(150)
+        self.vis_table.setAlternatingRowColors(True)
+        vis_layout.addWidget(self.vis_table)
         self.vis_tab.setLayout(vis_layout)
         tabs.addTab(self.vis_tab, "可视化")
 
@@ -4445,6 +4591,7 @@ class GCMSAnalysisFuncDialog(QDialog):
         self._feature_result_data = None
         self._differential_result_data = None
         self._visualization_result_data = None
+        self._differential_matrix = None
 
 
     def load_analyses(self):
@@ -4471,51 +4618,140 @@ class GCMSAnalysisFuncDialog(QDialog):
 
     # --- Framework for More Complex Analyses ---
 
+    def _analysis_label_map(self, analysis_ids):
+        """分析ID -> 易读标签（编号 - 样品名称），避免图上只显示数字ID"""
+        labels = {}
+        for aid in analysis_ids:
+            ana = self.session.query(GCMSAnalysis).get(aid)
+            if ana is None:
+                labels[aid] = f"#{aid}"
+                continue
+            num = (ana.number or '').strip()
+            name = (ana.name or '').strip()
+            labels[aid] = f"{num} {name}".strip() or f"#{aid}"
+        return labels
+
     def _prepare_compound_data(self, selected_analysis_ids):
         """Query compound data for selected analyses and return as a pandas DataFrame."""
         if not PANDAS_AVAILABLE:
             QMessageBox.warning(self, "功能受限", "pandas不可用，无法进行数据分析。")
             return pd.DataFrame()
-            
+
         if not selected_analysis_ids:
             return pd.DataFrame()
-        compounds = self.session.query(GCMSCompound).filter(GCMSCompound.analysis_id.in_(selected_analysis_ids)).all()
+        compounds = self.session.query(GCMSCompound).filter(
+            GCMSCompound.analysis_id.in_(selected_analysis_ids)).all()
+
+        labels = self._analysis_label_map(selected_analysis_ids)
         data = []
         for c in compounds:
+            # 优先用相对含量，缺失时回退到绝对含量，保证矩阵有数值
+            value = c.relative_content
+            if value is None:
+                value = c.content
+            try:
+                value = float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                value = 0.0
             data.append({
                 'analysis_id': c.analysis_id,
-                'analysis_name': c.analysis.name if c.analysis else '', # Include analysis name
-                'compound_name': c.name_cn or c.name_en,
-                'relative_content': c.relative_content or 0
+                'analysis_name': labels.get(c.analysis_id, f"#{c.analysis_id}"),
+                'compound_name': (c.name_cn or c.name_en or '').strip() or '未命名',
+                'relative_content': value
             })
         df = pd.DataFrame(data)
-        # You might want to pivot this DataFrame later depending on the analysis
-        # For example, to get a matrix of samples (rows) vs compounds (columns)
         return df
 
     def _perform_feature_analysis(self, df):
-        """Framework for feature analysis algorithms."""
+        """特征物质筛查：按总相对含量排序，并给出出现样品数与均值
+
+        返回 DataFrame，列为：化合物 / 总相对含量 / 出现样品数 / 平均相对含量
+        """
         print("Performing feature analysis...")
         if df.empty:
             print("DataFrame is empty for feature analysis.")
-            self._feature_result_data = pd.DataFrame() # Store empty for export
+            self._feature_result_data = pd.DataFrame()
             return pd.DataFrame()
-        feature_results = df.groupby('compound_name')['relative_content'].sum().sort_values(ascending=False)
-        # Store data for export
-        self._feature_result_data = feature_results.reset_index() # Convert Series to DataFrame for export
-        return feature_results
+
+        grouped = df.groupby('compound_name')['relative_content'].agg(
+            total='sum', mean='mean', samples='count')
+        grouped = grouped.sort_values('total', ascending=False)
+        result = grouped.reset_index().rename(columns={
+            'compound_name': '化合物',
+            'total': '总相对含量',
+            'mean': '平均相对含量',
+            'samples': '出现样品数',
+        })
+        result['平均相对含量'] = result['平均相对含量'].round(4)
+        result['总相对含量'] = result['总相对含量'].round(4)
+
+        self._feature_result_data = result
+        return result
 
     def _perform_differential_analysis(self, df):
-        """Framework for differential analysis algorithms (e.g., t-test, ANOVA)."""
+        """构建 化合物 x 样品 的相对含量矩阵，并计算差异指标"""
         print("Performing differential analysis...")
         if df.empty:
             print("DataFrame is empty for differential analysis.")
-            self._differential_result_data = pd.DataFrame() # Store empty for export
+            self._differential_result_data = pd.DataFrame()
             return pd.DataFrame()
-        pivot_df = df.pivot_table(index='compound_name', columns='analysis_id', values='relative_content', fill_value=0)
-        # Store data for export
-        self._differential_result_data = pivot_df
-        return pivot_df
+
+        matrix = df.pivot_table(index='analysis_name', columns='compound_name',
+                                values='relative_content', aggfunc='sum',
+                                fill_value=0)
+        # 化合物为行、样品为列，更符合调香分析阅读习惯
+        matrix = matrix.T
+        matrix = matrix.loc[:, [c for c in matrix.columns]]
+        self._differential_matrix = matrix
+        self._differential_result_data = matrix
+        return matrix
+
+    def _differential_metrics(self, matrix):
+        """基于 化合物 x 样品 矩阵计算差异指标
+
+        两组样品时给出 B/A 差异倍数与 log2FC；
+        多组时给出极差与变异系数 CV。
+        """
+        if matrix is None or matrix.empty:
+            return pd.DataFrame()
+
+        cols = list(matrix.columns)
+        stats = pd.DataFrame({
+            '均值': matrix.mean(axis=1),
+            '最大值': matrix.max(axis=1),
+            '最小值': matrix.min(axis=1),
+        })
+        stats['极差'] = stats['最大值'] - stats['最小值']
+
+        # 用 where() 把 0 置为 NaN 而非 pd.NA：
+        # pd.NA 无法再 astype(float)，会导致导出与计算报错
+        mean_nonzero = stats['均值'].abs().where(stats['均值'] != 0)
+        stats['变异系数CV'] = matrix.std(axis=1) / mean_nonzero
+        min_nonzero = stats['最小值'].where(stats['最小值'] != 0)
+        stats['最大值/最小值'] = stats['最大值'] / min_nonzero
+
+        if len(cols) == 2:
+            a, b = cols[0], cols[1]
+            stats[a] = matrix[a]
+            stats[b] = matrix[b]
+            denom = matrix[a].where(matrix[a] != 0)
+            ratio = matrix[b] / denom
+            stats['差异倍数(B/A)'] = ratio
+            stats['log2FC'] = [self._safe_log2(v) for v in ratio]
+
+        result = stats.round(4).sort_values('极差', ascending=False)
+        result.index.name = '化合物'
+        return result.reset_index()
+
+    @staticmethod
+    def _safe_log2(value):
+        """安全的 log2 计算，非正数或缺失返回 NaN"""
+        try:
+            if value is None or pd.isna(value) or float(value) <= 0:
+                return float('nan')
+            return math.log2(float(value))
+        except Exception:
+            return float('nan')
 
 
     def _perform_pca_analysis(self, df):
@@ -4526,40 +4762,116 @@ class GCMSAnalysisFuncDialog(QDialog):
             self._visualization_result_data = pd.DataFrame() # Store empty for export
             return pd.DataFrame() # Return empty DataFrame instead of None
 
-        pivot_df = df.pivot_table(index='analysis_id', columns='compound_name', values='relative_content', fill_value=0)
-        # Store data for export
-        self._visualization_result_data = pivot_df # Store the data used for visualization
+        # 样品为行、化合物为列
+        pivot_df = df.pivot_table(index='analysis_name', columns='compound_name',
+                                  values='relative_content', aggfunc='sum',
+                                  fill_value=0)
 
         if pivot_df.empty:
              print("Pivoted DataFrame is empty for PCA analysis.")
-             return pd.DataFrame() # Return empty DataFrame if pivot failed
+             return pd.DataFrame()
 
-        # Check if there are enough samples and features for PCA
+        # 至少需要 2 个样品与 2 种化合物才有降维意义
         if pivot_df.shape[0] < 2 or pivot_df.shape[1] < 2:
              print("Not enough data for meaningful PCA.")
-             return pd.DataFrame() # Return empty DataFrame if not enough data
+             return pd.DataFrame()
 
         try:
             from sklearn.decomposition import PCA
-            pca = PCA(n_components=2) # Example: Reduce to 2 components for 2D visualization
-            principal_components = pca.fit_transform(pivot_df)
-            pca_df = pd.DataFrame(data = principal_components, columns = ['principal_component_1', 'principal_component_2'], index=pivot_df.index)
+            # 主成分数受样本数与特征数共同限制，避免越界报错
+            n_comp = min(2, pivot_df.shape[0], pivot_df.shape[1])
+            pca = PCA(n_components=n_comp)
+            components = pca.fit_transform(pivot_df)
 
-            # Add analysis names back to PCA results for plotting
-            analysis_names = self.session.query(GCMSAnalysis.id, GCMSAnalysis.name).filter(GCMSAnalysis.id.in_(pca_df.index)).all()
-            name_map = {id: name for id, name in analysis_names}
-            pca_df['analysis_name'] = pca_df.index.map(name_map)
+            cols = ['principal_component_1', 'principal_component_2'][:n_comp]
+            pca_df = pd.DataFrame(data=components, columns=cols,
+                                  index=pivot_df.index)
+            if n_comp == 1:
+                pca_df['principal_component_2'] = 0.0
+            # 样品名放在索引上并命名，reset_index() 后即为 analysis_name 列，
+            # 避免索引名与列名重复导致 insert 冲突
+            pca_df.index.name = 'analysis_name'
 
-            return pca_df # Return PCA results as DataFrame
+            self._visualization_result_data = pca_df
+            return pca_df
 
         except ImportError:
             print("sklearn not installed. Cannot perform PCA.")
-            return pd.DataFrame() # Return empty DataFrame if sklearn is not available
+            return pd.DataFrame()
         except Exception as e:
             print(f"Error during PCA analysis: {e}")
-            return pd.DataFrame() # Return empty DataFrame on error
+            return pd.DataFrame()
 
 
+    # ---------- 绘图与展示辅助 ----------
+    def _fig_to_pixmap(self, fig):
+        """matplotlib figure -> QPixmap（失败返回 None）"""
+        from PyQt6.QtGui import QPixmap
+        try:
+            buf = BytesIO()
+            fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            pix = QPixmap()
+            pix.loadFromData(buf.read())
+            return pix if not pix.isNull() else None
+        except Exception as e:
+            print(f"图表转换失败: {e}")
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _set_scaled_pixmap(label, pix, max_w, max_h):
+        """按最大边缩放后显示在 QLabel 上，保持宽高比"""
+        label.setPixmap(pix.scaled(
+            max_w, max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def _draw_heatmap(self, matrix, ax, title):
+        """绘制热图；seaborn 不可用时回退到 matplotlib imshow"""
+        if sns is not None:
+            sns.heatmap(matrix, ax=ax, cmap='YlGnBu',
+                        cbar_kws={'label': '相对含量'})
+        else:
+            im = ax.imshow(matrix.values, aspect='auto', cmap='YlGnBu')
+            ax.set_xticks(range(len(matrix.columns)))
+            ax.set_xticklabels(matrix.columns, rotation=45, ha='right')
+            ax.set_yticks(range(len(matrix.index)))
+            ax.set_yticklabels(matrix.index)
+            plt.colorbar(im, ax=ax, label='相对含量')
+        ax.set_title(title)
+        ax.set_xlabel('样品')
+        ax.set_ylabel('化合物名称')
+
+    @staticmethod
+    def _fill_table(table, df):
+        """将 DataFrame 填充到 QTableWidget（含表头）"""
+        table.clear()
+        if df is None or df.empty:
+            table.setRowCount(0)
+            table.setColumnCount(0)
+            return
+        table.setColumnCount(len(df.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        table.setRowCount(len(df))
+        for r in range(len(df)):
+            for c in range(len(df.columns)):
+                value = df.iat[r, c]
+                if value is None or (isinstance(value, float) and pd.isna(value)):
+                    text = ''
+                elif isinstance(value, float):
+                    text = f"{value:,.4f}"
+                else:
+                    text = str(value)
+                table.setItem(r, c, QTableWidgetItem(text))
+        table.resizeColumnsToContents()
+
+    # ---------- 特征物质筛查 ----------
     def run_feature_screening(self):
         selected_ids = self.get_selected_analysis_ids()
         if not selected_ids:
@@ -4568,46 +4880,38 @@ class GCMSAnalysisFuncDialog(QDialog):
         df = self._prepare_compound_data(selected_ids)
         if df.empty:
             self.feature_fig_label.setText("选定的记录无化合物数据")
-            self._feature_result_data = pd.DataFrame() # Store empty for export
+            self._feature_result_data = pd.DataFrame()
             return
 
         feature_results = self._perform_feature_analysis(df)
-
         if feature_results.empty:
-             self.feature_fig_label.setText("特征筛查无结果")
-             self._feature_result_data = pd.DataFrame() # Store empty for export
-             return
+            self.feature_fig_label.setText("特征筛查无结果")
+            self._feature_result_data = pd.DataFrame()
+            return
 
-        # --- Visualization for Feature Screening (Example using matplotlib) ---
-        
+        self._fill_table(self.feature_table, feature_results)
+
         if not MATPLOTLIB_AVAILABLE:
             self.feature_fig_label.setText("matplotlib不可用，无法生成图表")
             return
 
         try:
-            # Display Top 10 features
-            top_features = feature_results.head(10)
-            fig, ax = plt.subplots(figsize=(6,4))
-            top_features.plot(kind='bar', ax=ax)
-            ax.set_ylabel('总相对含量')
-            ax.set_title('特征物质Top10 (选定分析)')
+            top = feature_results.head(15).iloc[::-1]  # 反转让最大值在最上方
+            fig, ax = plt.subplots(figsize=(7, max(3.0, len(top) * 0.35)))
+            ax.barh(top['化合物'], top['总相对含量'], color='#2E86AB')
+            ax.set_xlabel('总相对含量（所选样品合计）')
+            ax.set_title('特征物质 Top15（按总相对含量）')
             plt.tight_layout()
-
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=300) # Increase DPI for better clarity
-            plt.close(fig)
-            buf.seek(0)
-
-            from PyQt6.QtGui import QPixmap
-            pix = QPixmap()
-            pix.loadFromData(buf.read())
-            # Scale pixmap for display while maintaining aspect ratio
-            self.feature_fig_label.setPixmap(pix.scaled(400,300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)) # Use smooth transformation
+            pix = self._fig_to_pixmap(fig)
+            if pix is None:
+                self.feature_fig_label.setText("图表生成失败")
+            else:
+                self._set_scaled_pixmap(self.feature_fig_label, pix, 720, 500)
         except Exception as e:
             self.feature_fig_label.setText(f"可视化失败：{e}")
             print(f"Feature screening visualization failed: {e}")
 
-
+    # ---------- 差异物质分析 ----------
     def run_diff_analysis(self):
         selected_ids = self.get_selected_analysis_ids()
         if len(selected_ids) < 2:
@@ -4616,41 +4920,43 @@ class GCMSAnalysisFuncDialog(QDialog):
         df = self._prepare_compound_data(selected_ids)
         if df.empty:
             self.diff_fig_label.setText("选定的记录无化合物数据")
-            self._differential_result_data = pd.DataFrame() # Store empty for export
+            self._differential_result_data = pd.DataFrame()
+            self._differential_matrix = None
             return
-        pivot_df = self._perform_differential_analysis(df)
+        matrix = self._perform_differential_analysis(df)
 
-        if pivot_df.empty:
+        if matrix.empty:
             self.diff_fig_label.setText("差异分析无结果")
-            self._differential_result_data = pd.DataFrame() # Store empty for export
+            self._differential_result_data = pd.DataFrame()
+            self._differential_matrix = None
             return
 
-        # --- Visualization for Differential Analysis (Example using heatmap) ---
+        # 差异指标表：两组时给出差异倍数与 log2FC
+        metrics = self._differential_metrics(matrix)
+        self._fill_table(self.diff_table, metrics)
+        self._differential_result_data = metrics if not metrics.empty else matrix
+
+        if not MATPLOTLIB_AVAILABLE:
+            self.diff_fig_label.setText("matplotlib不可用，无法生成图表")
+            return
 
         try:
-            fig, ax = plt.subplots(figsize=(8, len(pivot_df) * 0.3 + 2)) # Adjust figure size based on number of compounds
-            sns.heatmap(pivot_df, ax=ax, cmap='YlGnBu')
-            ax.set_title('选定GC-MS记录的化合物相对含量热图') # Updated title
-            ax.set_xlabel('GC-MS记录 ID')
-            ax.set_ylabel('化合物名称')
+            n_rows = max(3, len(matrix) * 0.3 + 2)
+            fig, ax = plt.subplots(figsize=(8, n_rows))
+            self._draw_heatmap(
+                matrix, ax,
+                '化合物 x 样品 相对含量热图（按极差排序前20）')
             plt.tight_layout()
-
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=300) # Increase DPI for better clarity
-            plt.close(fig)
-            buf.seek(0)
-
-            from PyQt6.QtGui import QPixmap
-            pix = QPixmap()
-            pix.loadFromData(buf.read())
-            # Scale pixmap for display while maintaining aspect ratio
-            scaled_pix = pix.scaled(700, 500, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation) # Use smooth transformation
-            self.diff_fig_label.setPixmap(scaled_pix)
+            pix = self._fig_to_pixmap(fig)
+            if pix is None:
+                self.diff_fig_label.setText("图表生成失败")
+            else:
+                self._set_scaled_pixmap(self.diff_fig_label, pix, 720, 520)
         except Exception as e:
             self.diff_fig_label.setText(f"可视化失败：{e}")
             print(f"Differential analysis visualization failed: {e}")
 
-
+    # ---------- 可视化：热图 ----------
     def show_heatmap(self):
         selected_ids = self.get_selected_analysis_ids()
         if not selected_ids:
@@ -4659,41 +4965,106 @@ class GCMSAnalysisFuncDialog(QDialog):
         df = self._prepare_compound_data(selected_ids)
         if df.empty:
             self.vis_fig_label.setText("选定的记录无化合物数据")
-            self._visualization_result_data = pd.DataFrame() # Clear data for export
+            self._visualization_result_data = pd.DataFrame()
             return
 
-        # For visualization tab, let's also use the heatmap as an example via differential analysis framework
-        pivot_df = self._perform_differential_analysis(df) # Reuse diff analysis framework for heatmap
-
-        if pivot_df.empty:
+        matrix = self._perform_differential_analysis(df)
+        if matrix.empty:
             self.vis_fig_label.setText("可视化数据准备失败")
-            self._visualization_result_data = pd.DataFrame() # Clear data for export
+            self._visualization_result_data = pd.DataFrame()
             return
 
-        # --- Visualization (Example using heatmap) ---
+        self._visualization_result_data = matrix
+        self._fill_table(self.vis_table, matrix.reset_index())
+
+        if not MATPLOTLIB_AVAILABLE:
+            self.vis_fig_label.setText("matplotlib不可用，无法生成图表")
+            return
 
         try:
-            fig, ax = plt.subplots(figsize=(8, len(pivot_df) * 0.3 + 2)) # Adjust figure size based on number of compounds
-            sns.heatmap(pivot_df, ax=ax, cmap='YlGnBu')
-            ax.set_title('选定GC-MS分析样品-化合物相对含量热图 (可视化)') # Updated title
-            ax.set_xlabel('GC-MS记录 ID')
-            ax.set_ylabel('化合物名称')
+            # 化合物过多时只画差异最大的前 25 个，保证可读性
+            plot_df = matrix
+            if len(matrix) > 25:
+                spread = (matrix.max(axis=1) - matrix.min(axis=1))
+                plot_df = matrix.loc[spread.sort_values(ascending=False).head(25).index]
+            fig, ax = plt.subplots(figsize=(8, max(3, len(plot_df) * 0.3 + 2)))
+            self._draw_heatmap(plot_df, ax, '样品-化合物相对含量热图')
             plt.tight_layout()
-
-            buf = BytesIO()
-            plt.savefig(buf, format='png', dpi=300) # Increase DPI for better clarity
-            plt.close(fig)
-            buf.seek(0)
-
-            from PyQt6.QtGui import QPixmap
-            pix = QPixmap()
-            pix.loadFromData(buf.read())
-            # Scale pixmap for display while maintaining aspect ratio
-            scaled_pix = pix.scaled(500,350, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation) # Use smooth transformation
-            self.vis_fig_label.setPixmap(scaled_pix)
+            pix = self._fig_to_pixmap(fig)
+            if pix is None:
+                self.vis_fig_label.setText("图表生成失败")
+            else:
+                self._set_scaled_pixmap(self.vis_fig_label, pix, 720, 500)
         except Exception as e:
             self.vis_fig_label.setText(f"可视化失败：{e}")
             print(f"Visualization (Heatmap) failed: {e}")
+
+    # ---------- 可视化：PCA ----------
+    def run_pca_analysis(self):
+        """对勾选的GC-MS记录做PCA降维并绘制散点图"""
+        selected_ids = self.get_selected_analysis_ids()
+        if len(selected_ids) < 2:
+            QMessageBox.warning(self, "提示", "PCA分析至少需要勾选两组GC-MS记录！")
+            return
+        df = self._prepare_compound_data(selected_ids)
+        if df.empty:
+            self.vis_fig_label.setText("选定的记录无化合物数据")
+            return
+
+        pca_df = self._perform_pca_analysis(df)
+        if pca_df is None or pca_df.empty:
+            self.vis_fig_label.setText(
+                "PCA分析无结果：需要至少2组样品与2种化合物，且需安装 scikit-learn")
+            return
+
+        self._visualization_result_data = pca_df
+
+        try:
+            from sklearn.decomposition import PCA
+            pivot_df = df.pivot_table(index='analysis_name',
+                                      columns='compound_name',
+                                      values='relative_content',
+                                      aggfunc='sum', fill_value=0)
+            pca = PCA(n_components=2)
+            pca.fit(pivot_df)
+            explained = pca.explained_variance_ratio_ * 100
+        except Exception:
+            explained = None
+
+        self._fill_table(self.vis_table, pca_df.reset_index())
+
+        if not MATPLOTLIB_AVAILABLE:
+            self.vis_fig_label.setText("matplotlib不可用，无法生成图表")
+            return
+
+        try:
+            fig, ax = plt.subplots(figsize=(6.5, 5))
+            ax.scatter(pca_df['principal_component_1'],
+                       pca_df['principal_component_2'],
+                       s=90, color='#2E86AB', edgecolors='white', zorder=3)
+            for label, r in pca_df.iterrows():
+                ax.annotate(str(label),
+                            (r['principal_component_1'],
+                             r['principal_component_2']),
+                            fontsize=9, xytext=(6, 4),
+                            textcoords='offset points')
+            ax.axhline(0, color='#cccccc', linewidth=0.8, zorder=1)
+            ax.axvline(0, color='#cccccc', linewidth=0.8, zorder=1)
+            xlabel = '主成分 1' + (f" ({explained[0]:.1f}%)" if explained is not None else '')
+            ylabel = '主成分 2' + (f" ({explained[1]:.1f}%)" if explained is not None else '')
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title('GC-MS 样品 PCA 降维')
+            ax.grid(True, linestyle='--', alpha=0.3)
+            plt.tight_layout()
+            pix = self._fig_to_pixmap(fig)
+            if pix is None:
+                self.vis_fig_label.setText("图表生成失败")
+            else:
+                self._set_scaled_pixmap(self.vis_fig_label, pix, 720, 500)
+        except Exception as e:
+            self.vis_fig_label.setText(f"可视化失败：{e}")
+            print(f"PCA visualization failed: {e}")
 
 
     # Keep export_analysis_image and export_analysis_data methods as they are useful for analysis functions

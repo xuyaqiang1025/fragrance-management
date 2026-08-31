@@ -94,6 +94,22 @@ def _read_spreadsheet_ml(raw: bytes) -> pd.DataFrame:
     return pd.DataFrame(padded, columns=header)
 
 
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """统一表格形态：列名去空白、单元格转字符串、剔除全空行与全空列"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df.columns = [str(c).strip() for c in df.columns]
+    # 单元格统一转字符串，避免 Excel(数值型) 与 CSV(字符型) 行为不一致
+    df = df.astype(object).where(pd.notna(df), '')
+    _to_str = lambda v: '' if v is None else str(v).strip()
+    # pandas 2.1+ 用 DataFrame.map，旧版本回退 applymap
+    df = df.map(_to_str) if hasattr(df, 'map') else df.applymap(_to_str)
+    # 剔除全空行 / 全空列
+    df = df.dropna(axis=1, how='all')
+    df = df[~(df == '').all(axis=1)]
+    return df.reset_index(drop=True)
+
+
 def read_table_any(path: str) -> pd.DataFrame:
     """智能读取表格文件，返回 DataFrame；无法识别时抛出带中文说明的异常"""
     with open(path, 'rb') as f:
@@ -104,9 +120,9 @@ def read_table_any(path: str) -> pd.DataFrame:
 
     # ---- 1. 按文件魔数识别 ----
     if raw[:4] == b'PK\x03\x04':                      # zip容器 → xlsx/xlsm
-        return pd.read_excel(io.BytesIO(raw), engine='openpyxl')
+        return _normalize(pd.read_excel(io.BytesIO(raw), engine='openpyxl'))
     if raw[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':  # OLE容器 → xls
-        return pd.read_excel(io.BytesIO(raw), engine='xlrd')
+        return _normalize(pd.read_excel(io.BytesIO(raw), engine='xlrd'))
 
     # ---- 2. 文本类内容（CSV/TSV/HTML/XML，含各种伪Excel）----
     text, enc = _decode_text(raw)
@@ -118,12 +134,12 @@ def read_table_any(path: str) -> pd.DataFrame:
         if not tables:
             raise ValueError('HTML文件中未找到数据表格')
         # 取最大的表（通常业务数据表最大）
-        return max(tables, key=lambda t: t.shape[0] * t.shape[1])
+        return _normalize(max(tables, key=lambda t: t.shape[0] * t.shape[1]))
 
     if head.startswith('<?xml'):
         if 'spreadsheet' in head or 'workbook' in head \
                 or 'urn:schemas-microsoft-com:office:spreadsheet' in text[:2048].lower():
-            return _read_spreadsheet_ml(raw)
+            return _normalize(_read_spreadsheet_ml(raw))
         raise ValueError('无法识别的XML格式，请另存为 .xlsx 或 .csv 后重试')
 
     # 纯文本表格：嗅探分隔符
@@ -142,5 +158,4 @@ def read_table_any(path: str) -> pd.DataFrame:
                               engine='python')
             if df2.shape[1] > df.shape[1]:
                 df = df2
-    df = df.dropna(axis=1, how='all')
-    return df
+    return _normalize(df)

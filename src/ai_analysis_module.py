@@ -37,8 +37,43 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     np = None
 
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload
+
 from models import (Ingredient, Formula, StockRecord,
                     ingredient_formula, FormulaUsage)
+
+DEFAULT_WINDOW_DAYS = 90
+
+
+def compute_consumption(session, window_days=DEFAULT_WINDOW_DAYS):
+    """统计近 window_days 天的出库量（按原料编号汇总）
+
+    返回 (consumption, span_days)：
+      - consumption: {原料编号: 累计出库量}（取绝对值，兼容正负两种存储约定）
+      - span_days:   实际观测跨度天数，用于折算日均消耗，
+                     避免把「不足90天」的数据仍按90天摊薄
+    """
+    now = datetime.now()
+    start = now - timedelta(days=window_days)
+    records = session.query(StockRecord).filter(
+        StockRecord.is_deleted == False,
+        StockRecord.operation_type == 'out',
+        StockRecord.operation_time >= start
+    ).all()
+
+    consumption, earliest = {}, None
+    for r in records:
+        qty = abs(r.quantity or 0)
+        if qty <= 0:
+            continue
+        consumption[r.ingredient_number] = (
+            consumption.get(r.ingredient_number, 0) + qty)
+        if r.operation_time and (earliest is None or r.operation_time < earliest):
+            earliest = r.operation_time
+
+    span = max((now - earliest).days, 1) if earliest else window_days
+    return consumption, span
 
 
 @dataclass
@@ -58,21 +93,31 @@ class FormulaAnalyzer:
         self.session = session
 
     def _formula_texts(self):
-        """收集每个配方的文本特征（名称/描述/内容/成分名）"""
-        formulas = self.session.query(Formula).all()
-        texts, names = [], []
+        """收集配方对象与其文本特征（名称/描述/内容/成分名）
+
+        一次性预取成分，避免逐条触发懒加载造成 N+1 查询。
+        返回 (formulas, texts)。
+        """
+        formulas = (self.session.query(Formula)
+                    .options(joinedload(Formula.ingredients))
+                    .all())
+        texts = []
         for f in formulas:
             ing_names = [i.name for i in f.ingredients]
-            text = " ".join(filter(None, [f.name, f.description,
-                                          f.content, " ".join(ing_names)]))
-            texts.append(text)
-            names.append(f.name)
-        return names, texts
+            texts.append(" ".join(filter(None, [
+                f.name, f.description, f.content, " ".join(ing_names)])))
+        return formulas, texts
 
     def analyze_similarity(self, target_formula):
         """分析目标配方与其他配方的相似度"""
-        names, texts = self._formula_texts()
-        if target_formula.name not in names or len(names) < 2:
+        formulas, texts = self._formula_texts()
+        if len(formulas) < 2:
+            return None
+
+        # 用 id 定位目标，避免同名配方被错误匹配
+        target_idx = next((i for i, f in enumerate(formulas)
+                           if f.id == target_formula.id), None)
+        if target_idx is None:
             return None
 
         results = []
@@ -82,25 +127,21 @@ class FormulaAnalyzer:
                 matrix = vectorizer.fit_transform(texts)
             except ValueError:
                 return None
-            target_idx = names.index(target_formula.name)
-            sims = cosine_similarity(matrix[target_idx:target_idx + 1], matrix).flatten()
+            sims = cosine_similarity(
+                matrix[target_idx:target_idx + 1], matrix).flatten()
             # 成分重合度加权
             for idx, sim in enumerate(sims):
                 if idx == target_idx:
                     continue
-                other = self.session.query(Formula).filter(
-                    Formula.name == names[idx]).first()
-                overlap = self._ingredient_overlap(target_formula, other)
-                results.append((names[idx], float(sim), overlap))
+                overlap = self._ingredient_overlap(target_formula, formulas[idx])
+                results.append((formulas[idx].name, float(sim), overlap))
         else:
             # 无 sklearn 时退化为成分重合度
-            for idx, name in enumerate(names):
-                if name == target_formula.name:
+            for idx, other in enumerate(formulas):
+                if idx == target_idx:
                     continue
-                other = self.session.query(Formula).filter(
-                    Formula.name == name).first()
                 overlap = self._ingredient_overlap(target_formula, other)
-                results.append((name, overlap, overlap))
+                results.append((other.name, overlap, overlap))
 
         results.sort(key=lambda x: (x[1] + x[2]) / 2, reverse=True)
         return results[:10]
@@ -123,34 +164,22 @@ class CostPredictor:
         self.session = session
 
     def predict(self, days: int):
-        """预测未来 days 天的原料消耗成本"""
-        now = datetime.now()
-        start = now - timedelta(days=90)
-        records = self.session.query(StockRecord).filter(
-            StockRecord.is_deleted == False,
-            StockRecord.operation_time >= start
-        ).all()
-
-        consumption = {}  # number -> 90天累计出库量
-        for r in records:
-            if r.operation_type == 'out' and r.quantity:
-                consumption[r.ingredient_number] = (
-                    consumption.get(r.ingredient_number, 0) - r.quantity)
+        """预测未来 days 天的原料消耗成本（基于近90天出库记录）"""
+        consumption, span = compute_consumption(self.session)
 
         rows = []
         for number, used in consumption.items():
-            if used <= 0:
-                continue
             ing = self.session.query(Ingredient).filter(
                 Ingredient.number == number).first()
             if not ing:
                 continue
-            daily_rate = used / 90.0
+            daily_rate = used / span
             need = daily_rate * days
             price = ing.price or 0.0
             rows.append({
                 '原料编号': number,
                 '原料名称': ing.name,
+                '观测天数': span,
                 '日均消耗': round(daily_rate, 3),
                 f'{days}天需求量': round(need, 2),
                 '当前单价': price,
@@ -175,7 +204,7 @@ class InventoryOptimizer:
         stock_sums = dict(
             self.session.query(
                 StockRecord.ingredient_number,
-                func_sum(StockRecord.quantity)
+                func.sum(StockRecord.quantity)
             ).filter(StockRecord.is_deleted == False)
              .group_by(StockRecord.ingredient_number)
              .all()
@@ -185,34 +214,28 @@ class InventoryOptimizer:
     def optimize(self):
         """生成库存预警与采购建议"""
         stock = self.get_current_stock()
-        now = datetime.now()
-        start = now - timedelta(days=90)
-        records = self.session.query(StockRecord).filter(
-            StockRecord.is_deleted == False,
-            StockRecord.operation_time >= start
-        ).all()
-
-        consumption = {}
-        for r in records:
-            if r.operation_type == 'out' and r.quantity:
-                consumption[r.ingredient_number] = (
-                    consumption.get(r.ingredient_number, 0) - r.quantity)
+        consumption, span = compute_consumption(self.session)
 
         warnings, purchases = [], []
         ingredients = self.session.query(Ingredient).all()
         for ing in ingredients:
             current = stock.get(ing.number, 0) or 0
             threshold = ing.min_stock_threshold or 0
-            daily_rate = consumption.get(ing.number, 0) / 90.0
+            daily_rate = consumption.get(ing.number, 0) / span
+            # 无消耗历史时不做耗尽预测，避免产生 0 天耗尽的误导性预警
             days_left = (current / daily_rate) if daily_rate > 0 else None
 
             if current <= 0 and daily_rate > 0:
-                warnings.append((ing.number, ing.name, current, threshold,
-                                 '缺货', '立即采购'))
+                # 已耗尽且有消耗历史：优先按30天用量补货
+                suggested = max(daily_rate * 30, threshold)
+                warnings.append((ing.number, ing.name, round(current, 2),
+                                 threshold, '缺货',
+                                 f'立即采购，建议 {suggested:.1f}'))
             elif threshold > 0 and current <= threshold:
+                suggested = max(threshold * 2 - current, threshold)
                 warnings.append((ing.number, ing.name, round(current, 2),
                                  threshold, '低于安全库存',
-                                 f'建议采购 {max(threshold * 2 - current, threshold):.1f}'))
+                                 f'建议采购 {suggested:.1f}'))
             elif days_left is not None and days_left < 14:
                 warnings.append((ing.number, ing.name, round(current, 2),
                                  threshold, f'约{days_left:.0f}天后耗尽',
@@ -230,12 +253,6 @@ class InventoryOptimizer:
                         '预计费用': round(suggested * (ing.price or 0), 2)
                     })
         return warnings, purchases
-
-
-def func_sum(col):
-    """延迟导入聚合函数，避免顶层依赖"""
-    from sqlalchemy import func
-    return func.sum(col)
 
 
 class ChartGenerator:
@@ -270,14 +287,15 @@ class ChartGenerator:
     def _ingredient_frequency(self):
         rows = self.session.query(
             ingredient_formula.c.ingredient_id,
-            func_count(ingredient_formula.c.formula_id).label('cnt')
+            func.count(ingredient_formula.c.formula_id).label('cnt')
         ).group_by(ingredient_formula.c.ingredient_id).all()
         freq = sorted(rows, key=lambda x: x[1], reverse=True)[:15]
         if not freq:
             return None
         names, counts = [], []
         for ing_id, cnt in freq:
-            ing = self.session.query(Ingredient).get(ing_id)
+            # Query.get() 在 SQLAlchemy 2.0 已废弃，改用 Session.get()
+            ing = self.session.get(Ingredient, ing_id)
             names.append(ing.name if ing else f'#{ing_id}')
             counts.append(cnt)
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -333,11 +351,6 @@ class ChartGenerator:
         ax.set_ylabel('成分数量')
         ax.tick_params(axis='x', rotation=60)
         return self._fig_to_pixmap(fig)
-
-
-def func_count(col):
-    from sqlalchemy import func
-    return func.count(col)
 
 
 class AIAnalysisModule:
