@@ -15,6 +15,9 @@ src/ai_expert_config.json
 fragrance_app.log
 ai_expert_config.json
 
+# 助手工作区
+.workbuddy/
+
 # Python
 __pycache__/
 *.pyc

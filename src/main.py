@@ -408,14 +408,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"数据库初始化失败：{str(e)}")
     
     def _init_sample_data(self, db_existed=False):
-        """初始化示例数据（一次性播种：通过app_settings标记，删除后不再恢复）"""
+        """初始化示例数据（一次性播种：通过app_settings标记，删除后不再恢复）
+
+        健壮性增强（修复「删除配方后重载又复活」的根因之一）：
+        - 无论新库还是旧库，只要标记缺失就补写标记，避免任何历史版本在后续
+          启动时被反复重新播种示例配方；
+        - 播种前按编号去重，防止极端情况下重复插入；
+        - 仅当是全新数据库且无任何配方时才播种，已存在数据的库绝不改动。
+        """
         try:
             from models import AppSetting
             seeded = self.session.query(AppSetting).filter_by(
                 key='sample_formulas_seeded').first()
             if seeded:
                 return
-            # 标记缺失：新库播种示例；旧库（用户可能已删除示例）只补标记不播种
+            # 仅当是全新数据库且无任何配方时才播种示例
             if not db_existed:
                 formula_count = self.session.query(Formula).count()
                 if formula_count == 0:
@@ -448,14 +455,19 @@ class MainWindow(QMainWindow):
                         'evaluation': '醇厚烟草香，回味悠长',
                         'total_cost': 18.9
                     }
-                ]
-                
-                for formula_data in sample_formulas:
-                    formula = Formula(**formula_data)
-                    self.session.add(formula)
-
-                self.session.commit()
-                print(f"已添加 {len(sample_formulas)} 个示例配方")
+                    ]
+                    existing_numbers = {
+                        f.number for f in self.session.query(Formula.number).all()}
+                    added = 0
+                    for formula_data in sample_formulas:
+                        if formula_data['number'] in existing_numbers:
+                            continue
+                        self.session.add(Formula(**formula_data))
+                        added += 1
+                    if added:
+                        self.session.commit()
+                        print(f"已添加 {added} 个示例配方")
+            # 无论如何都补写标记，确保只播种一次（根治删除后复活）
             self.session.add(AppSetting(key='sample_formulas_seeded', value='1'))
             self.session.commit()
         except Exception as e:
@@ -1448,7 +1460,8 @@ class MainWindow(QMainWindow):
         self.stat_type.addItems([
             "原料使用频率统计",
             "配方成本统计",
-            "GC-MS分析统计"
+            "GC-MS分析统计",
+            "GC-MS化合物频次统计"
         ])
         self.stat_type.currentTextChanged.connect(self.update_statistics)
         type_layout.addWidget(type_label)
@@ -1505,6 +1518,8 @@ class MainWindow(QMainWindow):
             self.show_formula_cost_stats(time_range)
         elif stat_type == "GC-MS分析统计":
             self.show_gcms_analysis_stats(time_range)
+        elif stat_type == "GC-MS化合物频次统计":
+            self.show_gcms_compound_stats(time_range)
         # Removed Operation Log Stats as UserOperation table is removed
         # elif stat_type == "操作日志统计":
         #     self.show_operation_log_stats(time_range)
@@ -1761,7 +1776,85 @@ class MainWindow(QMainWindow):
             self._show_empty_chart("GC-MS分析统计 - 错误", str(e))
 
     # Removed show_operation_log_stats method
-            
+
+    def show_gcms_compound_stats(self, time_range):
+        """显示GC-MS化合物频次统计（跨样品按化合物汇总出现次数 Top15）
+
+        与「GC-MS分析统计」互补：后者看样品/供应商分布，本统计看
+        哪些化合物在多个样品中高频出现，辅助判断特征/标志性组分。
+        """
+        try:
+            start_date = self.get_start_date(time_range)
+
+            # 仅统计时间范围内的分析所包含的化合物
+            analysis_q = self.session.query(GCMSAnalysis.id)
+            if start_date:
+                analysis_q = analysis_q.filter(
+                    (GCMSAnalysis.analysis_time >= start_date) |
+                    (GCMSAnalysis.analysis_time.is_(None))
+                )
+            analysis_ids = [a[0] for a in analysis_q.all()]
+            if not analysis_ids:
+                self._show_empty_chart(
+                    "GC-MS化合物频次统计",
+                    f"所选时间范围（{time_range}）内暂无GC-MS分析记录。")
+                return
+
+            rows = self.session.query(
+                GCMSCompound.name_cn,
+                GCMSCompound.name_en,
+                func.count(GCMSCompound.id).label('cnt')
+            ).filter(GCMSCompound.analysis_id.in_(analysis_ids)).group_by(
+                GCMSCompound.name_cn, GCMSCompound.name_en
+            ).order_by(text('cnt DESC')).limit(15).all()
+
+            if not rows:
+                self._show_empty_chart(
+                    "GC-MS化合物频次统计",
+                    f"所选时间范围（{time_range}）内暂无化合物数据。")
+                return
+
+            def _cname(cn, en):
+                return (cn or en or '').strip() or '未知化合物'
+
+            names, counts = [], []
+            for cn, en, cnt in rows:
+                names.append(_cname(cn, en))
+                counts.append(cnt)
+
+            chart = QChart()
+            chart.setTitle(f"GC-MS化合物频次 Top15（{time_range}）")
+            series = QBarSeries()
+            bar_set = QBarSet("出现样品数")
+            for c in counts:
+                bar_set.append(c)
+            series.append(bar_set)
+            chart.addSeries(series)
+            axis_x = QBarCategoryAxis()
+            axis_x.append(names)
+            chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+            series.attachAxis(axis_x)
+            axis_y = QValueAxis()
+            max_c = max(counts)
+            axis_y.setRange(0, max_c * 1.1 if max_c > 0 else 10)
+            axis_y.setTitleText("出现样品数")
+            chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+            series.attachAxis(axis_y)
+            self.chart_view.setChart(chart)
+
+            self.stat_table.setColumnCount(3)
+            self.stat_table.setHorizontalHeaderLabels(["化合物", "出现样品数", "占比"])
+            self.stat_table.setRowCount(len(rows))
+            total = sum(counts)
+            for row, (cn, en, cnt) in enumerate(rows):
+                self.stat_table.setItem(row, 0, QTableWidgetItem(_cname(cn, en)))
+                self.stat_table.setItem(row, 1, QTableWidgetItem(str(cnt)))
+                rate = (cnt / total * 100) if total else 0
+                self.stat_table.setItem(row, 2, QTableWidgetItem(f"{rate:.2f}%"))
+        except Exception as e:
+            QMessageBox.warning(self, "统计错误", f"GC-MS化合物频次统计时发生错误：{str(e)}")
+            self._show_empty_chart("GC-MS化合物频次统计 - 错误", str(e))
+
     def get_start_date(self, time_range):
         """获取时间范围的开始日期"""
         now = datetime.now()
@@ -2675,6 +2768,12 @@ class MainWindow(QMainWindow):
 
     def delete_formula(self, formula):
         """删除配方"""
+        # 表格行里的 formula 来自分页线程中已关闭的会话（游离实例），
+        # 在主会话中按 id 重新取回，保证删除操作落在正确的会话上并真正落库。
+        formula = self.session.query(Formula).filter_by(id=formula.id).first()
+        if formula is None:
+            QMessageBox.information(self, "提示", "该配方已被删除或不存在。")
+            return
         # 检查是否有相关的配方使用记录
         usage_count = self.session.query(FormulaUsage).filter_by(formula_id=formula.id).count()
         
@@ -3120,18 +3219,16 @@ class MainWindow(QMainWindow):
 
 
     def import_gcms_compounds(self):
-        """批量导入GC-MS分析的化合物信息"""
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择化合物数据文件", "", "Excel 文件 (*.xlsx *.xls);;CSV 文件 (*.csv)")
+        """批量导入GC-MS分析的化合物信息（支持 xlsx/xlsm/xls/csv/tsv/txt/HTML/XML 多格式）"""
+        from table_io import read_table_any, SUPPORTED_FILE_FILTER
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择化合物数据文件", "", SUPPORTED_FILE_FILTER)
         if not file_path:
             return
 
         try:
-            if file_path.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(file_path)
-            elif file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
-            else:
-                QMessageBox.warning(self, "格式错误", "仅支持Excel或CSV文件！")
+            df = read_table_any(file_path)
+            if df.empty:
+                QMessageBox.warning(self, "格式错误", "文件为空或无法识别为表格！")
                 return
 
             # Assume required columns exist (adjust column names as per your file)

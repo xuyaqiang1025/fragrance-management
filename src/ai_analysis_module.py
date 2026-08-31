@@ -146,12 +146,32 @@ class FormulaAnalyzer:
         results.sort(key=lambda x: (x[1] + x[2]) / 2, reverse=True)
         return results[:10]
 
+    def _ing_ids(self, f):
+        """配方成分 id 集合；若未建立成分关联，则从 content 文本解析名称回查。
+
+        这样即便配方只用「名称:百分比:用量」文本录入、未关联 ingredient 行，
+        相似度与成分重合度仍能正常工作。
+        """
+        ids = set(i.id for i in f.ingredients)
+        if ids:
+            return ids
+        try:
+            names = [p.split(':')[0].strip()
+                     for p in (f.content or '').split(',') if ':' in p]
+            if names:
+                rows = self.session.query(Ingredient.id, Ingredient.name).all()
+                name2id = {n: i for i, n in rows}
+                return set(name2id[n] for n in names if n in name2id)
+        except Exception:
+            pass
+        return set()
+
     def _ingredient_overlap(self, fa, fb):
         """两个配方的成分重合度（Jaccard）"""
         if not fa or not fb:
             return 0.0
-        a = set(i.id for i in fa.ingredients)
-        b = set(i.id for i in fb.ingredients)
+        a = self._ing_ids(fa)
+        b = self._ing_ids(fb)
         if not a or not b:
             return 0.0
         return len(a & b) / len(a | b)
