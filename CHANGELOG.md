@@ -26,14 +26,15 @@
   用户运行的是早于 v3.1/v3.2 修复的打包产物；本次随 `v3.3` 重新打包后彻底解决。
 
 ### 问题3 — GC-MS / 智能分析 / 数据统计优化
-- `ui/gcms_analysis_func_dialog.py` 重写与修复：
-  - 修复 `analysis.supplier_info` → `analysis.supplier`（原 AttributeError）。
-  - 修复 `get_selected_sample_ids` 返回 `number` 误用作 `analysis_id`：
-    新增 `get_selected_analyses`，以 `GCMSAnalysis.number.in_(...)` 取真实对象/id。
-  - 后端 `backend_qt5agg`（Qt5）改为 `backend_qtagg`（Qt6），消除与 PyQt6 冲突。
-  - 实现 `analyze_characteristic_compounds`（每个样品按相对含量 Top10）与
-    `analyze_difference_compounds`（跨样品：共有 / 独有 / 部分共有化合物聚合），
-    并以 matplotlib `FigureCanvas` 绘制图表，移除空桩。
+- **GC-MS 分析对话框（重要更正）**：
+  经核查，真正的 `GCMSAnalysisFuncDialog` 定义在 `src/main.py`（内联类，约 4561–5215 行），
+  由 `show_gcms_analysis_func` 直接实例化，**功能完整且正确**：
+    - `load_analyses` 以 `analysis.id` 存储（无 number/analysis_id 混淆）；
+    - matplotlib 后端使用 `backend_qtagg`（PyQt6 兼容）；
+    - 已实现 特征物质筛查 / 差异物质分析（含差异倍数与 log2FC）/ 热图 / PCA 降维 / 图片与数据导出。
+  原 `ui/gcms_analysis_func_dialog.py` 是**未被任何代码引用的孤儿模块**（全项目 grep 无引用、打包 spec 未包含），
+  其上的改动不影响运行产物。该孤儿模块已在后续提交中移除，避免误导。
+  结论：GC-MS 模块在运行产物中已是优化后的完整实现，本次无需额外修复。
 - 数据统计新增第 4 类 **「GC-MS化合物频次统计」**（跨样品按化合物汇总 Top15 + 占比）。
 - `ai_analysis_module.py` 新增 `FormulaAnalyzer._ing_ids(f)`：
   优先从 `f.ingredients` 取原料 id；缺失时回退解析 `f.content`（名称:百分比:用量）按名查找，
