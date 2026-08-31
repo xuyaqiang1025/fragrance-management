@@ -164,3 +164,11 @@ class FormulaUsage(Base):
 
     formula = relationship('Formula', back_populates='usages')
     stock_records = relationship('StockRecord', back_populates='formula_usage')
+
+
+class AppSetting(Base):
+    """应用设置表（键值对，用于标记一次性操作等）"""
+    __tablename__ = 'app_settings'
+
+    key = Column(String(50), primary_key=True)
+    value = Column(Text)

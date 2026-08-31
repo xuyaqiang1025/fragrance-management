@@ -373,6 +373,7 @@ class MainWindow(QMainWindow):
             else:
                 base_dir = current_dir
             db_path = os.path.join(base_dir, 'fragrance_management.db')
+            db_existed = os.path.exists(db_path)
             # 添加线程安全配置
             engine = create_engine(f'sqlite:///{db_path}',
                                  pool_pre_ping=True,
@@ -388,20 +389,26 @@ class MainWindow(QMainWindow):
             else:
                 self.ai_analysis = None
             
-            # 检查并添加示例配方数据（仅在第一次运行时）
-            self._init_sample_data()
+            # 检查并添加示例配方数据（仅在数据库首次创建时，一次性播种）
+            self._init_sample_data(db_existed)
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"数据库初始化失败：{str(e)}")
     
-    def _init_sample_data(self):
-        """初始化示例数据"""
+    def _init_sample_data(self, db_existed=False):
+        """初始化示例数据（一次性播种：通过app_settings标记，删除后不再恢复）"""
         try:
-            # 检查是否已有配方数据
-            formula_count = self.session.query(Formula).count()
-            if formula_count == 0:
-                # 添加示例配方
-                sample_formulas = [
+            from models import AppSetting
+            seeded = self.session.query(AppSetting).filter_by(
+                key='sample_formulas_seeded').first()
+            if seeded:
+                return
+            # 标记缺失：新库播种示例；旧库（用户可能已删除示例）只补标记不播种
+            if not db_existed:
+                formula_count = self.session.query(Formula).count()
+                if formula_count == 0:
+                    # 添加示例配方
+                    sample_formulas = [
                     {
                         'number': 'F001',
                         'name': '清新薄荷',
@@ -434,11 +441,17 @@ class MainWindow(QMainWindow):
                 for formula_data in sample_formulas:
                     formula = Formula(**formula_data)
                     self.session.add(formula)
-                
+
                 self.session.commit()
                 print(f"已添加 {len(sample_formulas)} 个示例配方")
+            self.session.add(AppSetting(key='sample_formulas_seeded', value='1'))
+            self.session.commit()
         except Exception as e:
             print(f"初始化示例数据时出错: {e}")
+            try:
+                self.session.rollback()
+            except Exception:
+                pass
     
     def create_ingredients_page(self):
         """创建原料管理页面"""
@@ -1815,21 +1828,17 @@ class MainWindow(QMainWindow):
             self.update_statistics()
 
     def import_ingredients(self):
-        """批量导入原料数据，支持去重并覆盖"""
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择原料数据文件", "", "Excel 文件 (*.xlsx *.xls);;CSV 文件 (*.csv)")
+        """批量导入原料数据，支持去重并覆盖（xlsx/xlsm/xls/csv/tsv/txt及伪Excel）"""
+        from table_io import read_table_any, SUPPORTED_FILE_FILTER
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择原料数据文件", "", SUPPORTED_FILE_FILTER)
         if not file_path:
             return
         try:
             # 先回滚任何未完成的事务
             self.session.rollback()
-            
-            if file_path.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(file_path)
-            elif file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
-            else:
-                QMessageBox.warning(self, "格式错误", "仅支持Excel或CSV文件！")
-                return
+
+            df = read_table_any(file_path)
+            df.columns = [str(c).strip() for c in df.columns]
             field_map = {
                 '编号': 'number',
                 'CAS': 'cas_number',
@@ -1847,7 +1856,10 @@ class MainWindow(QMainWindow):
                 '香气变调': 'aroma_change',
                 '嗅香香气（1% in PG）': 'sniff_aroma',
                 '抽吸感官评价': 'sensory_evaluation',
-                '香韵构成': 'aroma_composition'
+                '香韵构成': 'aroma_composition',
+                '成本(元/g)': 'price',
+                '成本': 'price',
+                '价格': 'price',
             }
             # 检查必填列
             required_columns = ['原料名称']  # 只要求原料名称为必填
@@ -1873,6 +1885,15 @@ class MainWindow(QMainWindow):
                     for k in field_map:
                         if k in row and pd.notna(row[k]) and str(row[k]).strip():
                             data[field_map[k]] = str(row[k]).strip()
+
+                    # 成本列为数值型
+                    if 'price' in data:
+                        try:
+                            data['price'] = float(
+                                str(data['price'])
+                                .replace('¥', '').replace('￥', '').strip())
+                        except ValueError:
+                            data['price'] = 0.0
                     
                     # 确保必填字段存在
                     if 'name' not in data or not data['name']:
