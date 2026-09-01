@@ -14,6 +14,9 @@
 ### 问题1 — 多格式导入
 - `import_gcms_compounds`（及原料、配方导入）改用 `read_table_any` + `SUPPORTED_FILE_FILTER`，
   支持 xlsx / xlsm / xls / csv / tsv / txt / HTML / XML 等格式的自动识别与读取。
+- 文件选择框只列出 xlsx/xlsm/xls/csv/tsv/txt；XML 与 HTML 需经「所有文件(*)」选中，
+  但 `read_table_any` 均可正确解析。此处 XML 指 **Excel 2003 SpreadsheetML**。
+- 该 XML 路径曾有一个真实 bug，已在 `v3.3.1`（提交 `4f912f8`）中修复，详见下文。
 
 ### 问题2 — 删除配方后重新载入又出现
 - `delete_formula` 开头重新 `session.query(Formula).filter_by(id=...).first()`，
@@ -42,6 +45,32 @@
 
 ### 其他
 - `.gitignore` 增加 `.workbuddy/` 排除助手工作区。
+- 移除孤儿模块 `ui/gcms_analysis_func_dialog.py`（未被引用的死代码）。
+
+---
+
+## v3.3.1 — Excel 2003 XML 导入修复
+
+**提交：** `4f912f8`
+**日期：** 2026-09-01
+
+### 问题
+`read_table_any` 会先把文件头转小写，Excel 2003 XML（SpreadsheetML）中的
+`<Table>` 因此变成 `<table>`，命中了 HTML 分支的 `'<table' in head` 判断，
+导致 XML 被误送进 `pd.read_html`，报「**HTML文件中未找到数据表格**」；
+而排在它后面的 `<?xml` 分支永远执行不到 —— XML 导入实际是失效的。
+
+### 修复
+- 将 `<?xml` 判定**提到 HTML 判定之前**：文件开头的 `<?xml` 声明是无歧义信号。
+
+### 验证
+- 实测 `read_table_any`：**CSV / TSV / TXT / XLSX / HTML / XML(Excel 2003) 6 种格式全部通过**。
+- 说明：此处 XML 特指 **Excel 2003 SpreadsheetML**
+  （命名空间 `urn:schemas-microsoft-com:office:spreadsheet`）。
+
+### 打包
+- 该修复已随重新打包的 `release/香料管理系统.exe`（409,831,160 字节）发布。
+- 旧 exe 备份为 `release/香料管理系统_v3.2_20260829_旧版.exe`。
 
 ---
 
