@@ -128,6 +128,15 @@ def read_table_any(path: str) -> pd.DataFrame:
     text, enc = _decode_text(raw)
     head = text.lstrip('\ufeff ').lstrip()[:512].lower()
 
+    # XML 必须优先于 HTML 判定：
+    # SpreadsheetML 含 <Table>（lower 后为 <table），若先走 HTML 分支会被误判为
+    # HTML 并报「HTML文件中未找到数据表格」。<?xml 声明在开头是无歧义信号。
+    if head.startswith('<?xml'):
+        if 'spreadsheet' in head or 'workbook' in head \
+                or 'urn:schemas-microsoft-com:office:spreadsheet' in text[:2048].lower():
+            return _normalize(_read_spreadsheet_ml(raw))
+        raise ValueError('无法识别的XML格式，请另存为 .xlsx 或 .csv 后重试')
+
     if head.startswith('<!doctype html') or head.startswith('<html') \
             or '<table' in head:
         tables = pd.read_html(io.StringIO(text))
@@ -135,12 +144,6 @@ def read_table_any(path: str) -> pd.DataFrame:
             raise ValueError('HTML文件中未找到数据表格')
         # 取最大的表（通常业务数据表最大）
         return _normalize(max(tables, key=lambda t: t.shape[0] * t.shape[1]))
-
-    if head.startswith('<?xml'):
-        if 'spreadsheet' in head or 'workbook' in head \
-                or 'urn:schemas-microsoft-com:office:spreadsheet' in text[:2048].lower():
-            return _normalize(_read_spreadsheet_ml(raw))
-        raise ValueError('无法识别的XML格式，请另存为 .xlsx 或 .csv 后重试')
 
     # 纯文本表格：嗅探分隔符
     sample = text[:64 * 1024]
